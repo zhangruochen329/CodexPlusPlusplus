@@ -1,4 +1,4 @@
-﻿Unicode true
+Unicode true
 !include "MUI2.nsh"
 !include "StrFunc.nsh"
 ${Using:StrFunc} StrStr
@@ -18,6 +18,7 @@ RequestExecutionLevel user
 SetCompressor /SOLID lzma
 Var ExistingInstall
 Var HadDesktopEntry
+Var LegacyDeleteTries
 
 !define MUI_ICON "${ROOT}\apps\codex-plus-manager\src-tauri\icons\icon.ico"
 !define MUI_UNICON "${ROOT}\apps\codex-plus-manager\src-tauri\icons\icon.ico"
@@ -81,9 +82,19 @@ Section "Install"
   Push "codex-plus-plus-manager.exe"
   Call WaitForProcessExit
 
-  ; 双程序版本升级时只保留统一应用；清理失败则停止，避免残留旧管理工具。
+  ; 双程序版本升级时只保留统一应用。旧管理工具可能在本安装器被拉起后
+  ; 才真正退出（更新入口本身就跑在 manager 里），WaitForProcessExit 看到
+  ; 进程名消失时文件锁未必立刻释放，Delete 会静默失败；此处再轮询重试，
+  ; 而不是一次失败就把整次安装 Abort 掉（issue #2460）。
+  StrCpy $LegacyDeleteTries 0
+  legacy_binary_delete_loop:
   Delete "$INSTDIR\codex-plus-plus-manager.exe"
   IfFileExists "$INSTDIR\codex-plus-plus-manager.exe" 0 legacy_binary_removed
+    IntOp $LegacyDeleteTries $LegacyDeleteTries + 1
+    IntCmp $LegacyDeleteTries 20 legacy_binary_delete_failed
+    Sleep 500
+    Goto legacy_binary_delete_loop
+  legacy_binary_delete_failed:
     MessageBox MB_OK|MB_ICONSTOP "旧管理工具仍被占用。请退出 Codex++ 后重新安装。"
     Abort
   legacy_binary_removed:
@@ -131,7 +142,7 @@ Section "Install"
 
   ; 注册 codexplusplus:// 与 dreamskin:// URL 协议（issue #2354）。
   ; 键名与值同 codex-plus-core 的 install::windows::register_url_protocol 保持一致，
-  ; 应用内"安装入口/修复快捷方式"会以相同键幂等覆盖，两边互不冲突。
+  ; 应用内"修复快捷方式"会以相同键幂等覆盖，两边互不冲突。
   WriteRegStr HKCU "Software\Classes\codexplusplus" "" "URL:Codex++ Import Protocol"
   WriteRegStr HKCU "Software\Classes\codexplusplus" "URL Protocol" ""
   WriteRegStr HKCU "Software\Classes\codexplusplus\shell\open\command" "" '"$INSTDIR\codex-plus-plus.exe" "%1"'
@@ -155,6 +166,12 @@ Section "Uninstall"
   Call un.WaitForProcessExit
   Push "codex-plus-plus-manager.exe"
   Call un.WaitForProcessExit
+
+  ; 删除主程序前恢复 config.toml：仍指向本机代理 127.0.0.1:57321 时清回官方配置，
+  ; 否则卸载后官方 Codex 每次请求都 502（issue #406）。静默卸载同样执行；
+  ; 主程序失败也以 0 退出，不阻塞卸载。
+  IfFileExists "$INSTDIR\codex-plus-plus.exe" 0 +2
+    ExecWait '"$INSTDIR\codex-plus-plus.exe" --codex-plus-uninstall-cleanup'
 
   Delete "$DESKTOP\Codex++.lnk"
   Delete "$DESKTOP\Codex++ 管理工具.lnk"

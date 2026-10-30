@@ -63,7 +63,8 @@ fn manager_close_minimizes_to_tray_without_confirmation() {
     assert!(!lib_rs.contains("manager://close-requested"));
     assert!(lib_rs.contains("let _ = close_event_window.hide();"));
     assert!(!lib_rs.contains("startup_is_transient()"));
-    assert!(lib_rs.contains(".visible(true)"));
+    // 登录启动可以按已有设置隐藏窗口，手动打开仍保持可见。
+    assert!(lib_rs.contains(".visible(!start_minimized)"));
     assert!(lib_rs.contains("codex_plus_launcher::shutdown()"));
     assert!(!app_tsx.contains("CloseConfirmDialog"));
     assert!(app_tsx.contains("manager_exit_app"));
@@ -84,6 +85,44 @@ fn manager_keeps_a_visible_brand_tray_and_click_menu_when_hiding_the_macos_dock_
     assert!(lib_rs.contains("tauri::include_image!(\"icons/icon.png\")"));
     assert!(lib_rs.contains(".show_menu_on_left_click(true)"));
     assert!(lib_rs.contains(".tooltip(\"Codex++\")"));
+}
+
+// 返回 needle 之前文本最近的 #[cfg(...)] 属性。前提是设置语句与其平台门控
+// 属性之间没有插入其他 #[cfg(（install_tray 内的布局保证了这一点）；
+// 若日后重排语句，请同步调整这里的假设或改用语法解析。
+fn nearest_cfg_before<'a>(source: &'a str, needle: &str) -> &'a str {
+    let at = source.find(needle).expect(needle);
+    let before = &source[..at];
+    let start = before
+        .rfind("#[cfg(")
+        .expect("cfg attribute before the setting");
+    let end = before[start..]
+        .find(']')
+        .map(|offset| start + offset)
+        .expect("cfg attribute end");
+    &before[start..=end]
+}
+
+// issue #2676：Windows 左键单击直接唤起主窗口（菜单只留给右键），
+// 非 Windows 平台保持「点击弹出菜单」的原有行为不变。
+#[test]
+fn windows_tray_left_click_restores_the_window_and_keeps_the_menu_for_right_click() {
+    let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read manager lib.rs");
+
+    assert_eq!(
+        nearest_cfg_before(&lib_rs, ".show_menu_on_left_click(false)"),
+        "#[cfg(windows)]"
+    );
+    assert_eq!(
+        nearest_cfg_before(&lib_rs, ".show_menu_on_left_click(true)"),
+        "#[cfg(not(windows))]"
+    );
+    // 左键单击唤窗走统一的事件判定，不绕过 show_main_window。
+    assert!(lib_rs.contains("tray_event_shows_main_window(&event)"));
+    // CI 只在 Windows 跑 cargo test，谓词的平台门控靠这里文本守护：
+    // 去掉 cfg!(windows) && 会让非 Windows 平台的左键单击也唤窗（#2676 回归）。
+    assert!(lib_rs.contains("cfg!(windows) && left_click_up"));
 }
 
 #[test]
@@ -282,8 +321,8 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
     assert!(app_tsx.contains("function relayProfileSwitchCommand"));
     assert!(app_tsx.contains("return \"apply_pure_api_injection\""));
     assert!(app_tsx.contains("return \"apply_relay_injection\""));
-    assert!(app_tsx.contains("const createNewAggregateProfile = () =>"));
-    assert!(app_tsx.contains("onClick={createNewAggregateProfile}"));
+    assert!(app_tsx.contains("const createNewAggregateProfile = (mode: AggregateMode)"));
+    assert!(app_tsx.contains("onClick={() => createNewAggregateProfile("));
     assert!(app_tsx.contains("已打开聚合供应商详情"));
     assert!(app_tsx.contains(
         "buildRelayConfigToml(profile, { includeBearerToken: !profile.noAuth, requiresOpenAiAuth: false })"
@@ -307,7 +346,7 @@ fn relay_context_management_is_global_not_supplier_scoped() {
     let styles = std::fs::read_to_string(&styles).expect("read manager styles.css");
 
     assert!(app_tsx.contains("作为全局配置独立管理"));
-    assert!(app_tsx.contains("label: t(\"MCP&插件\")") || app_tsx.contains("label: \"MCP&插件\""));
+    assert!(app_tsx.contains("label: \"MCP\"") || app_tsx.contains("label: t(\"MCP\")"));
     assert!(
         app_tsx.contains("title={t(\"Codex MCP&插件\")}")
             || app_tsx.contains("title=\"Codex MCP&插件\"")
@@ -443,6 +482,10 @@ fn manager_update_install_keeps_visible_progress_bar() {
     assert!(app_tsx.contains("安装包更新进度"));
     assert!(app_tsx.contains("completedTitle={t(\"上次更新结果\")}"));
     assert!(app_tsx.contains("progress={updateInstallProgress}"));
-    assert!(app_tsx.contains("current.percent + 0.2"));
-    assert!(app_tsx.contains("下载或启动耗时较长"));
+    assert!(app_tsx.contains("listen<UpdateProgressEvent>(\"update-progress\""));
+    assert!(app_tsx.contains("data-indeterminate"));
+    assert!(app_tsx.contains("正在写入安装包并准备安装"));
+    assert!(app_tsx.contains("正在启动安装器"));
+    assert!(!app_tsx.contains("current.percent + 0.2"));
+    assert!(!app_tsx.contains("下载或启动耗时较长"));
 }

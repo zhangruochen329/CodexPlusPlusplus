@@ -90,6 +90,57 @@ fn installer_name_helpers_and_legacy_constants_keep_api_compatibility() {
 }
 
 #[test]
+fn windows_workflows_verify_nsis_and_support_both_program_files_directories() {
+    for workflow in ["pr-build.yml", "release-assets.yml"] {
+        let text = std::fs::read_to_string(format!("../../.github/workflows/{workflow}"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let install = text
+            .split_once("      - name: Install NSIS\n")
+            .unwrap()
+            .1
+            .split("      - name:")
+            .next()
+            .unwrap();
+        let build = text
+            .split_once("      - name: Build Windows installer\n")
+            .unwrap()
+            .1
+            .split("      - name:")
+            .next()
+            .unwrap();
+        for step in [install, build] {
+            assert!(step.contains("shell: pwsh"), "{workflow}");
+            assert!(
+                step.contains(r"${env:ProgramFiles(x86)}\NSIS\makensis.exe"),
+                "{workflow}"
+            );
+            assert!(
+                step.contains(r"$env:ProgramFiles\NSIS\makensis.exe"),
+                "{workflow}"
+            );
+            assert!(step.contains("Get-Command makensis.exe"), "{workflow}");
+            assert!(
+                step.contains("Test-Path -LiteralPath $_ -PathType Leaf"),
+                "{workflow}"
+            );
+            assert!(step.contains("if (-not $makensis) {"), "{workflow}");
+        }
+        assert!(install.contains("& $makensis /VERSION"), "{workflow}");
+        assert!(
+            install.contains("if ($LASTEXITCODE -eq 0) { break }"),
+            "{workflow}"
+        );
+        assert!(install.contains("$attempt -le 3"), "{workflow}");
+        assert!(
+            build.contains("if ($LASTEXITCODE -ne 0) { throw"),
+            "{workflow}"
+        );
+        assert!(build.contains("} finally {"), "{workflow}");
+    }
+}
+
+#[test]
 fn windows_installer_writes_the_same_uninstall_key_as_the_runtime() {
     let nsi = std::fs::read_to_string("../../scripts/installer/windows/CodexPlusPlus.nsi").unwrap();
     assert!(nsi.contains(r"Uninstall\CodexPlusPlus"));
@@ -163,11 +214,52 @@ fn windows_installer_waits_for_normal_exit_and_cancels_without_writing_apps() {
 }
 
 #[test]
-fn macos_dmg_includes_applications_shortcut_and_only_one_app() {
+fn windows_uninstaller_restores_proxy_config_before_deleting_main_exe() {
+    // issue #406：卸载后 config.toml 仍指向本机代理，官方 Codex 一直 502。
+    // 卸载器必须在进程退出后、删除主程序前让主程序清理一次。
+    let nsi = std::fs::read_to_string("../../scripts/installer/windows/CodexPlusPlus.nsi")
+        .unwrap()
+        .replace("\r\n", "\n");
+    let section = nsi
+        .split_once("Section \"Uninstall\"")
+        .unwrap()
+        .1
+        .split_once("SectionEnd")
+        .unwrap()
+        .0;
+    let cleanup = section
+        .find(r#"ExecWait '"$INSTDIR\codex-plus-plus.exe" --codex-plus-uninstall-cleanup'"#)
+        .expect("卸载器应调用主程序清理代理配置");
+    let last_wait = section.rfind("Call un.WaitForProcessExit").unwrap();
+    let delete_exe = section.find(r#"Delete "$INSTDIR\codex-plus-plus.exe""#).unwrap();
+    assert!(last_wait < cleanup);
+    assert!(cleanup < delete_exe);
+}
+
+#[test]
+fn macos_dmg_includes_one_visible_app_and_hidden_legacy_updater() {
     let script = std::fs::read_to_string("../../scripts/installer/macos/package-dmg.sh").unwrap();
     assert!(script.contains("ln -s /Applications \"$STAGE/Applications\""));
     assert!(script.contains("Codex++.app"));
-    assert!(!script.contains("Codex++ 管理工具.app"));
+    // The legacy updater still looks up this exact companion path. It is
+    // intentionally shipped as a hidden, self-exiting compatibility shim.
+    assert!(script.contains("Codex++ 管理工具.app"));
+    assert!(script.contains("codex-plus-legacy-shim"));
+    let app_commands: Vec<_> = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("create_app "))
+        .collect();
+    assert_eq!(
+        app_commands,
+        [
+            r#"create_app "Codex++" "CodexPlusPlus" "$BINARY_DIR/codex-plus-plus" "com.bigpizzav3.codexplusplus" "false""#,
+            r#"create_app "Codex++ 管理工具" "CodexPlusPlusManager" "$BINARY_DIR/codex-plus-legacy-shim" "com.bigpizzav3.codexplusplus.manager" "true""#,
+        ]
+    );
+    assert!(script.contains("printf '%s\\n' \"Codex++ 管理工具.app\" > \"$STAGE/.hidden\""));
+    assert!(script.contains("chflags hidden \"$STAGE/Codex++ 管理工具.app\""));
+    assert!(script.contains("set visible of item \"Codex++ 管理工具.app\" to false"));
 }
 
 #[test]
@@ -192,6 +284,7 @@ fn legacy_macos_layout_redirects_companions_to_unified_app() {
             assert!(
                 companion_binary_path_from_exe(Path::new(old), binary)
                     .to_string_lossy()
+                    .replace('\\', "/")
                     .eq_ignore_ascii_case("/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus")
             );
             assert_eq!(
